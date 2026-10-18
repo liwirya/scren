@@ -28,11 +28,14 @@ import json
 import math
 import os
 import sys
+import hashlib
 import pickle
+import random
 import re
 import tempfile
 import threading
 import time
+import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -41,6 +44,18 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
+
+# Kompatibilitas Python < 3.9: reportlab memanggil md5(usedforsecurity=False) yang belum didukung di sana.
+try:
+    hashlib.md5(usedforsecurity=False)
+except TypeError:
+    _md5_orig = hashlib.md5
+
+    def _md5_compat(*a, **k):
+        k.pop("usedforsecurity", None)
+        return _md5_orig(*a, **k)
+
+    hashlib.md5 = _md5_compat
 
 # --------------------------------------------------------------------------------------
 # KONFIGURASI METODE
@@ -181,6 +196,26 @@ _TV_BARS = {"5m": 500, "15m": 700, "1h": 700, "1d": 520, "1wk": 260}
 _FUND_FILE = os.path.join(tempfile.gettempdir(), "screener_fund_cache.pkl")
 
 
+_FETCH_SEM = threading.Semaphore(3)   # maks request harga bersamaan (diset dari --fetch-limit)
+_TRANSIENT = ("too many", "429", "rate limit", "rate-limit", "timed out", "timeout", "connection",
+              "temporar", "max retries", "reset by peer")
+
+
+def _fetch(fn, sym, interval, period, tries=3):
+    """Panggil sumber data dgn batas konkurensi + retry exponential backoff utk error sementara."""
+    last = None
+    for i in range(tries):
+        try:
+            with _FETCH_SEM:
+                return fn(sym, interval, period)
+        except Exception as e:
+            last = e
+            if i == tries - 1 or not any(k in str(e).lower() for k in _TRANSIENT):
+                break
+            time.sleep(1.5 * (2 ** i) + random.random())      # tunggu di luar semaphore
+    raise last
+
+
 def _hist_tv(sym, interval, period):
     """OHLCV dari TradingView (bursa IDX) lewat library tvdatafeed."""
     try:
@@ -209,15 +244,16 @@ def get_history(sym, interval, period):
     df = None
     if _SOURCE in ("auto", "tv") and sym.endswith(".JK") and interval in _TV_INTERVAL:
         try:
-            df = _hist_tv(sym, interval, period)
+            df = _fetch(_hist_tv, sym, interval, period)
         except Exception as e:
             if _SOURCE == "tv":
                 raise
             if "tv" not in _WARNED:
                 _WARNED.add("tv")
-                print(f"[info] TradingView gagal ({str(e)[:90]}) -> pakai Yahoo sebagai cadangan.")
+                print(f"[info] TradingView gagal ({str(e)[:90]}) -> pakai Yahoo (lebih lambat & rawan rate-limit, "
+                      f"terutama dari server cloud). Pasang tvdatafeed agar cepat.")
     if df is None:
-        df = _hist_yahoo(sym, interval, period)
+        df = _fetch(_hist_yahoo, sym, interval, period)
     with _CACHE_LOCK:
         _HIST_CACHE[key] = (time.time(), df)
     return df.copy()
@@ -967,7 +1003,7 @@ def narrative(sym, f, analyses, idx=True):
     return out
 
 
-def _chart_png(a, idx=True):
+def _chart_png_impl(a, idx=True):
     try:
         import io
         import matplotlib
@@ -1028,6 +1064,16 @@ def _chart_png(a, idx=True):
     return buf
 
 
+def _chart_png(a, idx=True):
+    try:
+        return _chart_png_impl(a, idx)
+    except Exception as e:
+        if "chart" not in _WARNED:
+            _WARNED.add("chart")
+            print(f"[info] grafik dilewati ({type(e).__name__}: {str(e)[:80]}); PDF tetap dibuat tanpa grafik.")
+        return None
+
+
 def build_pdf(path, title, rows, details, meta, idx=True, charts=True):
     """rows: ringkasan semua saham terurut | details: [(sym, f, analyses)] | meta: dict info run."""
     try:
@@ -1037,8 +1083,9 @@ def build_pdf(path, title, rows, details, meta, idx=True, charts=True):
         from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
                                         TableStyle)
         from xml.sax.saxutils import escape
-    except ImportError:
-        raise RuntimeError("Untuk PDF install dulu: pip install reportlab matplotlib")
+    except Exception as e:
+        raise RuntimeError(f"reportlab gagal dimuat ({type(e).__name__}: {e}). Install: pip install reportlab "
+                           f"(butuh Python 3.8+; disarankan 3.10+). Cek versi: python --version")
 
     def S(x):
         x = "-" if x is None else str(x)
@@ -1327,7 +1374,8 @@ def run_scan(args, idx):
                                    False, args.capital, args.risk_pct)
             return _make_row(sym, f, an[0])
         except Exception as e:
-            return dict(sym=sym, error=str(e)[:70])
+            return dict(sym=sym, error=f"{type(e).__name__}: {str(e)[:110]}".replace(sym, "<kode>").replace(sym.replace(".JK", ""), "<kode>"),
+                        where=_where(e, 2))
 
     print(f"Scanning {len(tickers)} saham | metode {method}"
           f"{' | tahap 1: teknikal semua, tahap 2: fundamental utk top ' + str(n_head) if two_pass else ''} ...")
@@ -1370,7 +1418,17 @@ def run_scan(args, idx):
               f"{r['rating']:18s}{px(r['entry'], idx):>9s}{px(r['sl'], idx):>9s}{px(r['tp1'], idx):>9s}  {r['sector'] or '-'}")
     errs = [r for r in rows if "error" in r]
     if errs:
-        print(f"\n{len(errs)} saham gagal diambil: " + ", ".join(f"{e['sym']}" for e in errs[:15]))
+        from collections import Counter
+        print(f"\n{len(errs)} dari {len(tickers)} saham gagal diambil. Penyebab terbanyak:")
+        for msg, n in Counter(e["error"] for e in errs).most_common(3):
+            ex = [e["sym"].replace(".JK", "") for e in errs if e["error"] == msg][:4]
+            wh = next(e.get("where") for e in errs if e["error"] == msg)
+            print(f"  - {n}x {msg}\n      contoh: {', '.join(ex)} | lokasi: {wh}")
+        if len(errs) > 0.3 * len(tickers):
+            print("  Banyak yang gagal: biasanya rate-limit/blokir sumber data. Coba: pasang tvdatafeed (sumber TradingView), "
+                  "kecilkan --workers 2 --fetch-limit 2, atau jalankan dari jaringan rumah (IP cloud sering diblokir Yahoo).")
+    if not ranked:
+        print("\nTidak ada saham yang berhasil dianalisis, PDF tidak dibuat.")
     print("\nDetail lengkap satu saham: python screener_saham.py KODE --method all --pdf")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -1382,7 +1440,11 @@ def run_scan(args, idx):
         print(f"Menyusun PDF ({len(ranked)} saham di ringkasan, {len(sel)} detail lengkap) ...")
         if args.method == "all":
             def deep(r):
-                f, an = analyze_symbol(r["sym"], list(METHODS), idx, not args.no_fund, False, args.capital, args.risk_pct)
+                try:
+                    f, an = analyze_symbol(r["sym"], list(METHODS), idx, not args.no_fund, False, args.capital, args.risk_pct)
+                except Exception as e:      # data intraday gagal -> pakai hasil swing yang sudah ada
+                    print(f"  [warn] detail {r['sym']} hanya swing ({type(e).__name__}: {str(e)[:60]})")
+                    f, an = r["_f"], [r["_a"]]
                 return r["sym"], f, an
             with ThreadPoolExecutor(max_workers=max(1, args.workers // 2)) as ex:
                 details = list(ex.map(deep, sel))
@@ -1395,6 +1457,23 @@ def run_scan(args, idx):
                     note=("Peringkat awal dari teknikal; fundamental ditambahkan untuk saham teratas." if two_pass else "-"))
         build_pdf(path, "Laporan Screening Saham", ranked, details, meta, idx, charts=not args.no_chart)
         print(f"PDF disimpan: {os.path.abspath(path)}")
+
+
+def _where(e, n=3):
+    try:
+        tb = traceback.extract_tb(e.__traceback__)[-n:]
+        return " <- ".join(f"{os.path.basename(t.filename)}:{t.lineno} {t.name}" for t in reversed(tb))
+    except Exception:
+        return "-"
+
+
+def _report_error(e, debug=False):
+    print(f"Error: {type(e).__name__}: {e}")
+    print(f"  lokasi: {_where(e)}")
+    if debug:
+        traceback.print_exc()
+    else:
+        print("  (tambahkan --debug untuk traceback lengkap)")
 
 
 def main():
@@ -1420,11 +1499,17 @@ def main():
     ap.add_argument("--pdf", nargs="?", const="auto", help="simpan laporan PDF (tanpa nama file = laporan_saham_TGL_JAM.pdf)")
     ap.add_argument("--detail-top", type=int, default=20, help="jumlah saham teratas yang dibuatkan halaman detail lengkap di PDF")
     ap.add_argument("--no-chart", action="store_true", help="PDF tanpa grafik")
+    ap.add_argument("--debug", action="store_true", help="tampilkan traceback lengkap bila error")
+    ap.add_argument("--fetch-limit", type=int, default=3, help="maks request harga bersamaan (default 3; kecilkan jika kena rate-limit)")
     ap.add_argument("--source", choices=["auto", "tv", "yahoo"], default="auto",
                     help="sumber harga: auto = TradingView lalu Yahoo (default)")
     args = ap.parse_args()
-    global _SOURCE
+    global _SOURCE, _FETCH_SEM
     _SOURCE = args.source
+    _FETCH_SEM = threading.Semaphore(max(1, args.fetch_limit))
+    if sys.version_info < (3, 9):
+        print(f"[peringatan] Python {sys.version_info[0]}.{sys.version_info[1]} terlalu lama; library terbaru sering error "
+              f"(contoh: 'type' object is not subscriptable). Disarankan Python 3.10+ (cek: python --version).")
 
     idx = args.market == "idx"
     if not args.tickers and args.scan is None and not args.scan_file and not args.universe:
@@ -1441,7 +1526,7 @@ def main():
                 try:
                     once()
                 except Exception as e:
-                    print(f"Error: {e}")
+                    _report_error(e, args.debug)
                 print(f"\n[watch] refresh tiap {args.watch} detik. Ctrl+C untuk berhenti.")
                 time.sleep(args.watch)
         except KeyboardInterrupt:
@@ -1450,7 +1535,8 @@ def main():
         try:
             once()
         except Exception as e:
-            sys.exit(f"Error: {e}")
+            _report_error(e, args.debug)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
