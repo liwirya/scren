@@ -29,11 +29,13 @@ import math
 import os
 import sys
 import pickle
+import re
 import tempfile
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -70,12 +72,14 @@ METHODS = {
     ),
 }
 
+# Perkiraan LQ45 (konstituen resmi BEI berganti tiap evaluasi; periode 3 Agu-30 Okt 2026: INDY & NCKL masuk,
+# SMGR & TOWR keluar). Untuk daftar resmi/terbaru pakai --scan-file dengan daftar dari idx.co.id.
 LQ_UNIVERSE = [
-    "BBCA", "BBRI", "BMRI", "BBNI", "BRIS", "ARTO", "TLKM", "ISAT", "EXCL", "MTEL", "TOWR",
+    "BBCA", "BBRI", "BMRI", "BBNI", "BRIS", "TLKM", "ISAT", "EXCL", "MTEL",
     "ASII", "UNTR", "UNVR", "ICBP", "INDF", "CPIN", "JPFA", "KLBF", "MAPI", "ACES", "ERAA",
     "ADRO", "PTBA", "ITMG", "HRUM", "MEDC", "PGAS", "AKRA", "ANTM", "MDKA", "INCO", "TINS",
-    "AMMN", "BRPT", "TPIA", "BREN", "SMGR", "INTP", "CTRA", "BSDE", "SMRA", "PWON", "JSMR",
-    "GOTO", "EMTK", "ESSA",
+    "AMMN", "BRPT", "TPIA", "BREN", "INTP", "CTRA", "BSDE", "PWON", "JSMR",
+    "GOTO", "EMTK", "ESSA", "INDY", "NCKL", "BUMI", "DSSA", "HEAL",
 ]
 
 
@@ -589,6 +593,7 @@ def analyze_method(sym, method, idx, capital=None, risk_pct=None):
         macd=dict(macd=float(l.macd), signal=float(l.macd_sig), hist=float(l.macd_hist)),
         bb=(float(l.bb_lo), float(l.bb_up)), vol_ratio=float(l.vol_ratio),
         bias=bias, rating=rating_from_bias(bias), notes=notes, plan=plan, avg_value=avg_val,
+        chart_df=df.tail(160).copy(),
     )
 
 
@@ -808,6 +813,455 @@ def print_full(sym, f, analyses, idx):
 
 
 # --------------------------------------------------------------------------------------
+# UNIVERSE: LQ45 (perkiraan) / SELURUH saham IDX (scanner TradingView)
+# --------------------------------------------------------------------------------------
+_UNI_FILE = os.path.join(tempfile.gettempdir(), "screener_universe.json")
+
+
+def _scanner_all(ttl=6 * 3600):
+    """Daftar semua saham IDX + harga/volume/market cap/sektor dari TradingView scanner (1 request)."""
+    import urllib.request
+    try:
+        with open(_UNI_FILE, encoding="utf-8") as fh:
+            c = json.load(fh)
+        if time.time() - c["t"] < ttl and c["rows"]:
+            return c["rows"]
+    except Exception:
+        pass
+    col_sets = [
+        ["name", "close", "volume", "market_cap_basic", "sector", "average_volume_30d_calc"],
+        ["name", "close", "volume", "market_cap_basic", "sector"],
+        ["name", "close", "volume"],
+    ]
+    last_err = None
+    for cols in col_sets:
+        payload = {"filter": [], "options": {"lang": "en"}, "markets": ["indonesia"],
+                   "symbols": {"query": {"types": []}, "tickers": []}, "columns": cols,
+                   "sort": {"sortBy": "volume", "sortOrder": "desc"}, "range": [0, 1500]}
+        req = urllib.request.Request(
+            "https://scanner.tradingview.com/indonesia/scan", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                js = json.loads(r.read().decode())
+        except Exception as e:
+            last_err = e
+            continue
+        rows = []
+        for it in js.get("data", []):
+            code = str(it.get("s", "")).split(":")[-1]
+            if not re.fullmatch(r"[A-Z]{4}", code):      # buang waran/rights/kode non-saham
+                continue
+            d = dict(zip(cols, it.get("d", [])))
+            rows.append(dict(code=code, close=d.get("close"), vol=d.get("volume"),
+                             avgvol=d.get("average_volume_30d_calc"), mcap=d.get("market_cap_basic"),
+                             sector=d.get("sector")))
+        if rows:
+            try:
+                with open(_UNI_FILE, "w", encoding="utf-8") as fh:
+                    json.dump({"t": time.time(), "rows": rows}, fh)
+            except Exception:
+                pass
+            return rows
+    raise RuntimeError(f"Scanner TradingView gagal ({last_err}). Alternatif: --scan-file daftar.txt")
+
+
+def load_all_idx(args):
+    rows = _scanner_all()
+    for r in rows:
+        r["value"] = (r["close"] or 0) * (r["avgvol"] or r["vol"] or 0)     # nilai transaksi/hari (Rp)
+    keep = [r for r in rows if (r["close"] or 0) >= args.min_price and r["value"] >= args.min_value]
+    keep.sort(key=lambda r: -r["value"])
+    if args.max_stocks and args.max_stocks > 0:
+        keep = keep[: args.max_stocks]
+    note = (f"Seluruh saham IDX: {len(rows)} kode di scanner -> {len(keep)} lolos filter "
+            f"(harga >= {args.min_price:,.0f}; nilai transaksi >= Rp {args.min_value:,.0f}/hari)")
+    return [r["code"] for r in keep], note
+
+
+# --------------------------------------------------------------------------------------
+# RINGKASAN NARASI (Indonesia) + PDF
+# --------------------------------------------------------------------------------------
+def calc_overall(f, a):
+    cfg = METHODS[a["method"]]
+    tech_n = (a["bias"] + 100) / 2
+    fs = f["score"] if f and f.get("score") is not None else None
+    return tech_n if fs is None or cfg["w_fund"] == 0 else cfg["w_tech"] * tech_n + cfg["w_fund"] * fs
+
+
+def _make_row(sym, f, a):
+    p = a["plan"]
+    return dict(sym=sym, price=a["price"], trend=a["trend"]["label"], rsi=a["rsi"], bias=a["bias"],
+                fund=(f["score"] if f and f.get("score") is not None else None),
+                score=calc_overall(f, a), rating=a["rating"], side=p["side"], entry=p.get("entry"),
+                sl=p.get("stop_loss"), tp1=(p.get("targets") or [None])[0],
+                sector=(f or {}).get("sector"), _f=f, _a=a)
+
+
+def narrative(sym, f, analyses, idx=True):
+    code = sym.replace(".JK", "")
+    a = analyses[0]
+    t, price = a["trend"], a["price"]
+    out = []
+    s = (f"{code} berada di {px(price, idx)} dan dalam {t['label']} pada timeframe {a['interval']} "
+         f"(kekuatan {t['strength']:.0%}; struktur {t['structure']}).")
+    if a.get("htf_trend"):
+        same = a["htf_trend"]["label"] == t["label"]
+        s += (f" Timeframe lebih besar ({a['htf']}) berstatus {a['htf_trend']['label']}"
+              + (", sehingga searah." if same else ", jadi sinyal belum sepenuhnya searah."))
+    out.append(s)
+
+    rsi = a["rsi"]
+    zone = ("jenuh beli (rawan koreksi)" if rsi > 70 else "kuat/bullish" if rsi >= 55 else "netral" if rsi >= 45
+            else "lemah" if rsi >= 30 else "jenuh jual (potensi pantulan)")
+    m = a["macd"]
+    s = (f"Momentum: RSI {rsi:.0f} ({zone}); MACD "
+         f"{'di atas' if m['macd'] > m['signal'] else 'di bawah'} garis sinyal "
+         f"(histogram {'positif' if m['hist'] > 0 else 'negatif'}). ")
+    vr = a["vol_ratio"]
+    s += (f"Volume {vr:.1f}x rata-rata, " + ("mendukung pergerakan." if vr >= 1.3 else "relatif sepi." if vr < 0.7
+                                                else "normal."))
+    out.append(s)
+
+    s = "Level kunci: "
+    if a["support"]:
+        v = a["support"][0][0]
+        s += f"support terdekat {px(v, idx)} ({(v - price) / price:+.1%}) "
+    if a["resistance"]:
+        v = a["resistance"][0][0]
+        s += f"dan resistance terdekat {px(v, idx)} ({(v - price) / price:+.1%}). "
+    s += f"Fibonacci: {a['fib']['zone']} ({a['fib']['direction']})."
+    out.append(s)
+
+    if f and f.get("score") is not None:
+        good = [n.split(" -> ")[0] for n in f["score_notes"] if n.endswith("baik") or n.endswith("positif")][:3]
+        weak = [n.split(" -> ")[0] for n in f["score_notes"] if n.endswith("lemah") or n.endswith("negatif")][:3]
+        s = f"Fundamental ({f.get('sector') or '-'}): skor {f['score']:.0f}/100."
+        if good:
+            s += " Kuat di: " + "; ".join(good) + "."
+        if weak:
+            s += " Lemah di: " + "; ".join(weak) + "."
+        out.append(s)
+    else:
+        out.append("Fundamental: data tidak tersedia dari sumber, keputusan hanya berbasis teknikal.")
+
+    for an in analyses:
+        p = an["plan"]
+        if p["side"] == "NO TRADE":
+            out.append(f"{an['method'].upper()}: belum ada setup beli ({p['reason']}).")
+        else:
+            out.append(f"{an['method'].upper()}: {p['status'].lower()}; entry {px(p['entry'], idx)}, stop loss "
+                       f"{px(p['stop_loss'], idx)}, cut loss {px(p['cut_loss'], idx)}, TP1 {px(p['targets'][0], idx)} "
+                       f"(RR 1:{p['rr'][0]:.1f}), TP3 {px(p['targets'][2], idx)}.")
+    risks = []
+    if rsi > 70:
+        risks.append("RSI jenuh beli")
+    if a.get("htf_trend") and a["htf_trend"]["label"] == "DOWNTREND":
+        risks.append("melawan tren timeframe besar")
+    if a.get("avg_value") and a["avg_value"] < 1e9:
+        risks.append("likuiditas rendah (slippage/spread lebar)")
+    if f and f.get("score") is not None and f["score"] < 40:
+        risks.append("fundamental lemah")
+    if risks:
+        out.append("Risiko utama: " + ", ".join(risks) + ".")
+    return out
+
+
+def _chart_png(a, idx=True):
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    df = a.get("chart_df")
+    if df is None or len(df) < 20:
+        return None
+    n = len(df)
+    x = np.arange(n)
+    fig, (ax, axr) = plt.subplots(2, 1, figsize=(7.4, 4.3), sharex=True,
+                                  gridspec_kw={"height_ratios": [3.2, 1], "hspace": 0.08})
+    col = np.where((df.close >= df.open).values, "#1b9e5a", "#d6403a")
+    ax.vlines(x, df.low.values, df.high.values, colors=col, linewidth=0.7)
+    ax.bar(x, np.maximum((df.close - df.open).abs().values, 1e-9), bottom=np.minimum(df.open, df.close).values,
+           width=0.65, color=col)
+    for c, lab, cc in (("ema9", "EMA9", "#f0a500"), ("ema21", "EMA21", "#1f77b4"),
+                       ("sma50", "SMA50", "#7f3fbf"), ("sma200", "SMA200", "#444444")):
+        if c in df and df[c].notna().sum() > 5:
+            ax.plot(x, df[c].values, lw=0.9, color=cc, label=lab)
+    lo, hi = float(df.low.min()), float(df.high.max())
+    for v, _ in a["support"][:2]:
+        ax.axhline(v, color="#1b9e5a", ls="--", lw=0.7, alpha=0.8)
+    for v, _ in a["resistance"][:2]:
+        ax.axhline(v, color="#d6403a", ls="--", lw=0.7, alpha=0.8)
+    p = a["plan"]
+    if p["side"] != "NO TRADE":
+        ax.axhline(p["entry"], color="#1f4fd8", lw=0.9)
+        ax.axhline(p["stop_loss"], color="#d6403a", lw=1.0)
+        for tp in p["targets"]:
+            ax.axhline(tp, color="#1b9e5a", ls=":", lw=0.9)
+        ax.text(n - 1, p["entry"], " ENTRY", fontsize=6, color="#1f4fd8", va="bottom", ha="right")
+        ax.text(n - 1, p["stop_loss"], " SL", fontsize=6, color="#d6403a", va="top", ha="right")
+        lo, hi = min(lo, p["stop_loss"]), max(hi, p["targets"][0])
+    pad = (hi - lo) * 0.08
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.tick_params(labelsize=6)
+    ax.grid(alpha=0.15)
+    ax.legend(fontsize=6, ncol=4, loc="upper left", frameon=False)
+    axr.plot(x, df.rsi.values, color="#555", lw=0.8)
+    axr.axhline(70, color="#d6403a", lw=0.5, ls="--")
+    axr.axhline(30, color="#1b9e5a", lw=0.5, ls="--")
+    axr.set_ylim(0, 100)
+    axr.set_ylabel("RSI", fontsize=6)
+    axr.tick_params(labelsize=6)
+    axr.grid(alpha=0.15)
+    ticks = np.linspace(0, n - 1, 6).astype(int)
+    fmt = "%d %b %y" if a["interval"] in ("1d", "1wk") else "%d %b %H:%M"
+    axr.set_xticks(ticks)
+    axr.set_xticklabels([df.index[i].strftime(fmt) for i in ticks], fontsize=6)
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.98, bottom=0.08)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def build_pdf(path, title, rows, details, meta, idx=True, charts=True):
+    """rows: ringkasan semua saham terurut | details: [(sym, f, analyses)] | meta: dict info run."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
+                                        TableStyle)
+        from xml.sax.saxutils import escape
+    except ImportError:
+        raise RuntimeError("Untuk PDF install dulu: pip install reportlab matplotlib")
+
+    def S(x):
+        x = "-" if x is None else str(x)
+        return escape(x.encode("cp1252", "replace").decode("cp1252"))
+
+    base = getSampleStyleSheet()
+    st = dict(
+        h1=ParagraphStyle("h1", parent=base["Title"], fontSize=18, leading=22, alignment=0, spaceAfter=4),
+        h2=ParagraphStyle("h2", parent=base["Heading2"], fontSize=11, leading=14, textColor=colors.HexColor("#1f3a5f"),
+                          spaceBefore=8, spaceAfter=3),
+        body=ParagraphStyle("body", parent=base["Normal"], fontSize=8.5, leading=11.5),
+        cell=ParagraphStyle("cell", parent=base["Normal"], fontSize=7.5, leading=9.3),
+        small=ParagraphStyle("small", parent=base["Normal"], fontSize=7, leading=9, textColor=colors.HexColor("#555555")),
+        white=ParagraphStyle("white", parent=base["Normal"], fontSize=10, leading=13, textColor=colors.white),
+    )
+    W = 523
+    GRID = colors.HexColor("#cfd4da")
+    LBL = colors.HexColor("#f1f3f5")
+
+    def P(t, s="body"):
+        return Paragraph(S(t), st[s])
+
+    def kv(rows_, widths=(120, W - 120)):
+        data = [[Paragraph(f"<b>{S(k)}</b>", st["cell"]), Paragraph(S(v), st["cell"])] for k, v in rows_]
+        t = Table(data, colWidths=list(widths))
+        t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.25, GRID), ("BACKGROUND", (0, 0), (0, -1), LBL),
+                               ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 2),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+        return t
+
+    def grid3(items):
+        data = []
+        for i in range(0, len(items), 3):
+            chunk = items[i:i + 3] + [("", "")] * (3 - len(items[i:i + 3]))
+            row = []
+            for k, v in chunk:
+                row += [Paragraph(f"<b>{S(k)}</b>", st["cell"]), Paragraph(S(v), st["cell"])]
+            data.append(row)
+        t = Table(data, colWidths=[64, 108, 64, 108, 64, 108][:6])
+        t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.25, GRID), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("BACKGROUND", (0, 0), (0, -1), LBL), ("BACKGROUND", (2, 0), (2, -1), LBL),
+                               ("BACKGROUND", (4, 0), (4, -1), LBL), ("TOPPADDING", (0, 0), (-1, -1), 2),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+        return t
+
+    def tone(score):
+        return colors.HexColor("#1b7f4d") if score >= 65 else colors.HexColor("#b3392f") if score <= 35 \
+            else colors.HexColor("#5b6670")
+
+    def footer(c, doc):
+        c.saveState()
+        c.setFont("Helvetica", 6.5)
+        c.setFillColor(colors.HexColor("#666666"))
+        c.drawString(36, 20, "Alat bantu analisis - BUKAN rekomendasi investasi. Data dapat tertunda/tidak akurat; "
+                             "verifikasi ke sumber resmi & kelola risiko.")
+        c.drawRightString(595 - 36, 20, f"Hal. {doc.page}")
+        c.restoreState()
+
+    story = [P(title, "h1"),
+             kv([("Waktu laporan", meta.get("time")), ("Universe", meta.get("universe")),
+                 ("Metode / ranking", meta.get("method")), ("Jumlah dianalisis", meta.get("count")),
+                 ("Sumber data", meta.get("source")), ("Catatan", meta.get("note"))]),
+             Spacer(1, 6),
+             P("Cara membaca: Skor total = bobot skor teknikal (bias -100..+100 dinormalkan 0-100) dan skor fundamental "
+               "(0-100) sesuai metode. BUY (LONG) hanya muncul bila setup teknikal cukup kuat dan tidak melawan tren "
+               "timeframe besar. Stop loss = batas struktur/ATR; cut loss = batas darurat (keluar tanpa menunggu). "
+               "Saham BEI tidak praktis untuk short-sell ritel, jadi sinyal bearish = menunggu/menghindari.", "small")]
+
+    # ---- ringkasan
+    story.append(P("Ringkasan Peringkat", "h2"))
+    cnt = {}
+    for r in rows:
+        cnt[r["rating"]] = cnt.get(r["rating"], 0) + 1
+    story.append(P("Distribusi sinyal: " + " | ".join(f"{k}: {v}" for k, v in sorted(cnt.items(), key=lambda x: -x[1])), "small"))
+    story.append(Spacer(1, 3))
+    head = ["#", "Kode", "Sektor", "Harga", "Trend", "RSI", "Tekn", "Fund", "Skor", "Sinyal", "Entry", "SL", "TP1"]
+    data = [head]
+    for i, r in enumerate(rows, 1):
+        data.append([str(i), r["sym"].replace(".JK", ""), (r["sector"] or "-")[:13], px(r["price"], idx),
+                     r["trend"][:9], f"{r['rsi']:.0f}", f"{r['bias']:+d}",
+                     f"{r['fund']:.0f}" if r["fund"] is not None else "-", f"{r['score']:.0f}", r["rating"][:17],
+                     px(r["entry"], idx) if r["entry"] else "-", px(r["sl"], idx) if r["sl"] else "-",
+                     px(r["tp1"], idx) if r["tp1"] else "-"])
+    cw = [20, 32, 58, 36, 54, 22, 26, 24, 26, 80, 40, 38, 38]
+    t = Table(data, colWidths=cw, repeatRows=1)
+    sty = [("FONTSIZE", (0, 0), (-1, -1), 6.6), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+           ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a5f")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+           ("GRID", (0, 0), (-1, -1), 0.25, GRID), ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+           ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5), ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+           ("ALIGN", (4, 0), (4, -1), "LEFT"), ("ALIGN", (9, 0), (9, -1), "LEFT")]
+    for i, r in enumerate(rows, 1):
+        if r["score"] >= 65:
+            sty.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#e6f4ec")))
+        elif r["score"] <= 35:
+            sty.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#fbe9e7")))
+    t.setStyle(TableStyle(sty))
+    story.append(t)
+
+    # ---- detail per saham
+    for sym, f, analyses in details:
+        code = sym.replace(".JK", "")
+        story.append(PageBreak())
+        a0 = analyses[0]
+        ov = calc_overall(f, a0)
+        name = (f or {}).get("name") or code
+        banner = Table([[Paragraph(f"<b>{S(code)}</b> - {S(name)}", st["white"]),
+                         Paragraph(f"<b>Skor {ov:.0f}/100</b> | {S(a0['rating'])}", st["white"])]],
+                       colWidths=[330, 193])
+        banner.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), tone(ov)), ("TOPPADDING", (0, 0), (-1, -1), 5),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("ALIGN", (1, 0), (1, 0), "RIGHT")]))
+        story += [banner, Spacer(1, 4)]
+        story.append(P("Ringkasan Analisis", "h2"))
+        for para in narrative(sym, f, analyses, idx):
+            story += [P(para), Spacer(1, 2)]
+
+        if f:
+            story.append(P("Profil Perusahaan", "h2"))
+            story.append(P(f"Sektor / Industri: {f.get('sector') or '-'} / {f.get('industry') or '-'} | "
+                           f"Website: {f.get('website') or '-'} | Karyawan: {f.get('employees') or '-'}", "small"))
+            summ = f.get("summary_id") or f.get("summary")
+            if summ:
+                story.append(P(summ if len(summ) < 1100 else summ[:1100] + " ..."))
+            if f.get("news"):
+                story.append(P("Berita / aksi korporasi terbaru:", "small"))
+                for n in f["news"][:5]:
+                    story.append(P("- " + n, "small"))
+            story.append(P("Fundamental", "h2"))
+            items = [("Market cap", big(f["market_cap"], idx)), ("PER", num(f["per"])), ("Fwd PER", num(f["fwd_per"])),
+                     ("PBV", num(f["pbv"])), ("EV/EBITDA", num(f["ev_ebitda"])), ("EPS", num(f["eps"])),
+                     ("BVPS", num(f["bvps"])), ("Div. yield", pct(f["div_yield"])), ("Payout", pct(f["payout"])),
+                     ("ROE", pct(f["roe"])), ("ROA", pct(f["roa"])), ("Beta", num(f["beta"])),
+                     ("Gross margin", pct(f["gpm"])), ("Op. margin", pct(f["opm"])), ("Net margin", pct(f["npm"])),
+                     ("Growth rev.", pct(f["rev_growth"])), ("Growth laba", pct(f["earn_growth"])),
+                     ("DER", f"{num(f['der'])}%"), ("Current ratio", num(f["current_ratio"])),
+                     ("Total utang", big(f["total_debt"], idx)), ("Kas", big(f["total_cash"], idx)),
+                     ("Operating CF", big(f["ocf"], idx)), ("Free CF", big(f["fcf"], idx)),
+                     ("Insider", pct(f["held_insiders"])), ("Institusi", pct(f["held_inst"])),
+                     ("52w High", px(f["hi52"], idx)), ("52w Low", px(f["lo52"], idx)), ("", "")]
+            story.append(grid3(items))
+            if f.get("history"):
+                story.append(Spacer(1, 3))
+                story.append(P("Laporan tahunan (pendapatan / laba bersih): " + " | ".join(
+                    f"{h['year']}: {big(h['revenue'], idx)} / {big(h['net_income'], idx)}" for h in f["history"]), "small"))
+            story.append(Spacer(1, 3))
+            story.append(P(f"Skor fundamental: {f['score'] if f['score'] is not None else 'n/a'} / 100", "body"))
+            story.append(P(" | ".join(f["score_notes"]), "small"))
+
+        for a in analyses:
+            p = a["plan"]
+            head_ = P(f"{a['label']}  [TF {a['interval']} | TF besar {a['htf']}]", "h2")
+            png = _chart_png(a, idx) if charts else None
+            if png:
+                story.append(KeepTogether([head_, Image(png, width=W, height=W * 4.3 / 7.4)]))   # judul tidak terpisah dari grafik
+            else:
+                story.append(head_)
+            t_ = a["trend"]
+            age = f" (usia data ~{a['bar_age_min']:.0f} menit)" if a.get("bar_age_min") is not None else ""
+            o = a["ohlc"]
+            fb = a["fib"]
+            rows_t = [
+                ("Bar terakhir", f"{a['last_bar']}{age}"),
+                ("Harga / OHLC", f"{px(a['price'], idx)} | O {px(o['open'], idx)} H {px(o['high'], idx)} "
+                                 f"L {px(o['low'], idx)} | Vol {o['volume']:,.0f} | ATR {px(a['atr'], idx)} | "
+                                 f"Nilai transaksi rata-rata/bar {big(a['avg_value'], idx)}"),
+                ("Trend", f"{t_['label']} (kekuatan {t_['strength']:.0%}) | struktur {t_['structure']}"
+                          + (f" | TF besar: {a['htf_trend']['label']}" if a.get("htf_trend") else "")),
+                ("Moving average", " | ".join(f"{k.upper()} {px(v, idx)}" for k, v in a["ma"].items())),
+                ("RSI / Stoch / MACD", f"RSI {a['rsi']:.1f} | Stoch %K/%D {a['stoch'][0]:.0f}/{a['stoch'][1]:.0f} | "
+                                       f"MACD {a['macd']['macd']:.2f} sig {a['macd']['signal']:.2f} hist {a['macd']['hist']:.2f}"),
+                ("Bollinger / Volume", f"{px(a['bb'][0], idx)} - {px(a['bb'][1], idx)} | volume {a['vol_ratio']:.1f}x rata-rata"),
+                ("Support", ", ".join(f"{px(v, idx)} ({n}x)" for v, n in a["support"]) or "-"),
+                ("Resistance", ", ".join(f"{px(v, idx)} ({n}x)" for v, n in a["resistance"]) or "-"),
+            ]
+            if a.get("pivot_points"):
+                rows_t.append(("Pivot hari lalu", " | ".join(f"{k} {px(v, idx)}" for k, v in a["pivot_points"].items())))
+            rows_t += [
+                ("Fibonacci", f"{fb['direction']}: low {px(fb['low'], idx)} -> high {px(fb['high'], idx)} | {fb['zone']}"),
+                ("Fib retracement", " | ".join(f"{k:.1%}={px(v, idx)}" for k, v in fb["retracement"].items())),
+                ("Fib extension", " | ".join(f"{k}={px(v, idx)}" for k, v in fb["extension"].items())),
+                ("Sinyal", " ; ".join(a["notes"])),
+                ("Skor bias teknikal", f"{a['bias']:+d} (-100..+100) => {a['rating']} | skor total {calc_overall(f, a):.0f}/100"),
+            ]
+            story.append(kv(rows_t))
+            story.append(Spacer(1, 4))
+            if p["side"] == "NO TRADE":
+                plan_rows = [("Trade plan", f"NO TRADE - {p['reason']}")] + [("Pantau", w) for w in p["watch"]]
+            else:
+                plan_rows = [("Keputusan", f"{p['side']} | {p['status']}"),
+                             ("Entry", f"{px(p['entry'], idx)} (alternatif buy-on-pullback: {px(p['entry_pullback'], idx)})"),
+                             ("Stop loss", f"{px(p['stop_loss'], idx)} (risiko {p['risk_pct']:.2%} / {px(p['risk_per_share'], idx)} per saham)"),
+                             ("Cut loss", f"{px(p['cut_loss'], idx)} (batas darurat: keluar tanpa menunggu bila tembus/gap down)")]
+                for i, (tp, rr) in enumerate(zip(p["targets"], p["rr"]), 1):
+                    plan_rows.append((f"TP{i}", f"{px(tp, idx)} (RR 1:{rr:.1f})"))
+                if p.get("fib_targets"):
+                    plan_rows.append(("Target fib ext.", ", ".join(px(v, idx) for v in p["fib_targets"])))
+                if p.get("position"):
+                    ps = p["position"]
+                    plan_rows.append(("Ukuran posisi", f"{ps['lots']} lot ({ps['shares']:,} saham) | nilai {big(ps['value'], idx)} | "
+                                                       f"rugi maks jika SL {big(ps['max_loss'], idx)}"))
+                plan_rows.append(("Trailing", p["trail"]))
+            pt = kv(plan_rows)
+            pt.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e3ecf7"))]))
+            story.append(pt)
+
+    story += [Spacer(1, 10), P("Disclaimer: laporan ini dihasilkan otomatis dari data publik (TradingView/Yahoo Finance) dan "
+                               "rumus indikator. Bukan nasihat/rekomendasi investasi. Semua keputusan dan risiko ada pada "
+                               "pengguna.", "small")]
+    doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=34, bottomMargin=34,
+                            title=title, author="screener_saham.py")
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return path
+
+
+def _pdf_path(args):
+    p = args.pdf
+    if p in (None, ""):
+        return None
+    if p == "auto":
+        p = f"laporan_saham_{datetime.now():%Y%m%d_%H%M}.pdf"
+    return p if p.lower().endswith(".pdf") else p + ".pdf"
+
+
+# --------------------------------------------------------------------------------------
 # RUNNER
 # --------------------------------------------------------------------------------------
 def analyze_symbol(sym, methods, idx, with_fund, translate, capital, risk_pct):
@@ -825,6 +1279,10 @@ def analyze_symbol(sym, methods, idx, with_fund, translate, capital, risk_pct):
     return f, analyses
 
 
+def _clean(a):
+    return {k: v for k, v in a.items() if k != "chart_df"}
+
+
 def run_single(args, idx):
     sym = norm_ticker(args.tickers[0], args.market)
     methods = list(METHODS) if args.method == "all" else [args.method]
@@ -833,42 +1291,76 @@ def run_single(args, idx):
     print_full(sym, f, analyses, idx)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump(dict(symbol=sym, fundamental=f, technical=analyses), fh, indent=2, default=str, ensure_ascii=False)
+            json.dump(dict(symbol=sym, fundamental=f, technical=[_clean(a) for a in analyses]), fh, indent=2,
+                      default=str, ensure_ascii=False)
         print(f"\nHasil disimpan ke {args.json}")
+    path = _pdf_path(args)
+    if path:
+        meta = dict(time=f"{datetime.now():%Y-%m-%d %H:%M:%S} WIB", universe=sym, method=", ".join(methods),
+                    count=1, source=_SOURCE + " (harga) + Yahoo (fundamental)", note="Laporan satu saham")
+        build_pdf(path, f"Laporan Analisis Saham - {sym.replace('.JK', '')}", [_make_row(sym, f, analyses[0])],
+                  [(sym, f, analyses)], meta, idx, charts=not args.no_chart)
+        print(f"\nPDF disimpan: {os.path.abspath(path)}")
 
 
 def run_scan(args, idx):
-    tickers = list(args.scan or [])
+    tickers = list(args.scan or []) + (list(args.tickers) if len(args.tickers) > 1 else [])
     if args.scan_file:
         with open(args.scan_file) as fh:
             tickers += [x.strip() for x in fh.read().replace(",", "\n").split() if x.strip()]
+    uni_note = "Daftar manual"
     if not tickers:
-        tickers = LQ_UNIVERSE
+        if args.universe == "all":
+            tickers, uni_note = load_all_idx(args)
+        else:
+            tickers, uni_note = list(LQ_UNIVERSE), "LQ45 (perkiraan; verifikasi daftar resmi di idx.co.id)"
     tickers = [norm_ticker(t, args.market) for t in dict.fromkeys(tickers)]
     method = "swing" if args.method == "all" else args.method
     cfg = METHODS[method]
+    two_pass = args.universe == "all" or len(tickers) > 60
+    n_head = max(args.detail_top, args.top)
+    print(uni_note)
 
     def work(sym):
         try:
-            f, an = analyze_symbol(sym, [method], idx, not args.no_fund and cfg["w_fund"] > 0, False,
-                                   args.capital, args.risk_pct)
-            a = an[0]
-            tech_n = (a["bias"] + 100) / 2
-            fs = f["score"] if f and f.get("score") is not None else None
-            overall = tech_n if fs is None else cfg["w_tech"] * tech_n + cfg["w_fund"] * fs
-            p = a["plan"]
-            return dict(sym=sym, price=a["price"], trend=a["trend"]["label"], rsi=a["rsi"], bias=a["bias"],
-                        fund=fs, score=overall, rating=a["rating"], side=p["side"],
-                        entry=p.get("entry"), sl=p.get("stop_loss"), tp1=(p.get("targets") or [None])[0],
-                        sector=(f or {}).get("sector"))
+            f, an = analyze_symbol(sym, [method], idx, (not two_pass) and not args.no_fund and cfg["w_fund"] > 0,
+                                   False, args.capital, args.risk_pct)
+            return _make_row(sym, f, an[0])
         except Exception as e:
-            return dict(sym=sym, error=str(e)[:60])
+            return dict(sym=sym, error=str(e)[:70])
 
-    print(f"Scanning {len(tickers)} saham | metode {method} ...")
+    print(f"Scanning {len(tickers)} saham | metode {method}"
+          f"{' | tahap 1: teknikal semua, tahap 2: fundamental utk top ' + str(n_head) if two_pass else ''} ...")
+    rows, done = [], 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        rows = list(ex.map(work, tickers))
-    ok = sorted([r for r in rows if "error" not in r], key=lambda r: -r["score"])
-    ok = [r for r in ok if r["score"] >= args.min_score][: args.top]
+        futs = [ex.submit(work, t) for t in tickers]
+        for fu in as_completed(futs):
+            rows.append(fu.result())
+            done += 1
+            if done % 10 == 0 or done == len(futs):
+                print(f"\r  progres {done}/{len(futs)}", end="", flush=True)
+    print()
+    valid = sorted([r for r in rows if "error" not in r], key=lambda r: -r["score"])
+
+    if two_pass and not args.no_fund and cfg["w_fund"] > 0 and valid:
+        head = valid[:n_head]
+
+        def enrich(r):
+            try:
+                f = get_fundamentals(r["sym"], False)
+                a = r["_a"]
+                r.update(_make_row(r["sym"], f, a))
+            except Exception:
+                pass
+            return r
+
+        print(f"Tahap 2: mengambil fundamental {len(head)} saham teratas ...")
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            head = list(ex.map(enrich, head))
+        valid = sorted(head, key=lambda r: -r["score"]) + valid[n_head:]
+
+    ranked = [r for r in valid if r["score"] >= args.min_score]
+    ok = ranked[: args.top]
     print(f"\n{'KODE':8s}{'SKOR':>6s}{'TEKN':>6s}{'FUND':>6s} {'TREND':10s}{'RSI':>5s} {'SINYAL':18s}"
           f"{'ENTRY':>9s}{'SL':>9s}{'TP1':>9s}  SEKTOR")
     for r in ok:
@@ -879,10 +1371,30 @@ def run_scan(args, idx):
     errs = [r for r in rows if "error" in r]
     if errs:
         print(f"\n{len(errs)} saham gagal diambil: " + ", ".join(f"{e['sym']}" for e in errs[:15]))
-    print("\nDetail lengkap satu saham: python screener_saham.py KODE --method swing")
+    print("\nDetail lengkap satu saham: python screener_saham.py KODE --method all --pdf")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump(ok, fh, indent=2, default=str)
+            json.dump([{k: v for k, v in r.items() if not k.startswith("_")} for r in ok], fh, indent=2, default=str)
+
+    path = _pdf_path(args)
+    if path and ranked:
+        sel = ranked[: args.detail_top]
+        print(f"Menyusun PDF ({len(ranked)} saham di ringkasan, {len(sel)} detail lengkap) ...")
+        if args.method == "all":
+            def deep(r):
+                f, an = analyze_symbol(r["sym"], list(METHODS), idx, not args.no_fund, False, args.capital, args.risk_pct)
+                return r["sym"], f, an
+            with ThreadPoolExecutor(max_workers=max(1, args.workers // 2)) as ex:
+                details = list(ex.map(deep, sel))
+        else:
+            details = [(r["sym"], r["_f"], [r["_a"]]) for r in sel]
+        meta = dict(time=f"{datetime.now():%Y-%m-%d %H:%M:%S} WIB", universe=uni_note,
+                    method=f"ranking pakai {method}" + (" | detail: swing + daytrade + scalping" if args.method == "all" else ""),
+                    count=f"{len(valid)} berhasil dari {len(tickers)} (gagal: {len(errs)})",
+                    source=f"{_SOURCE} (harga) + Yahoo (fundamental, top {n_head})" if two_pass else f"{_SOURCE} + Yahoo",
+                    note=("Peringkat awal dari teknikal; fundamental ditambahkan untuk saham teratas." if two_pass else "-"))
+        build_pdf(path, "Laporan Screening Saham", ranked, details, meta, idx, charts=not args.no_chart)
+        print(f"PDF disimpan: {os.path.abspath(path)}")
 
 
 def main():
@@ -901,6 +1413,13 @@ def main():
     ap.add_argument("--risk-pct", type=float, help="risiko per trade (%% dari modal), mis. 1")
     ap.add_argument("--watch", type=int, help="refresh otomatis tiap N detik (near-realtime)")
     ap.add_argument("--json", help="simpan hasil ke file JSON")
+    ap.add_argument("--universe", choices=["lq45", "all"], help="lq45 = LQ45 (perkiraan); all = SELURUH saham IDX (scanner TradingView)")
+    ap.add_argument("--min-value", type=float, default=1e9, help="filter likuiditas universe 'all': nilai transaksi/hari minimal (Rp), default 1 miliar")
+    ap.add_argument("--min-price", type=float, default=50, help="filter harga minimal universe 'all' (default 50)")
+    ap.add_argument("--max-stocks", type=int, default=150, help="maks saham dianalisis dari universe 'all' (urut likuiditas; 0 = semua)")
+    ap.add_argument("--pdf", nargs="?", const="auto", help="simpan laporan PDF (tanpa nama file = laporan_saham_TGL_JAM.pdf)")
+    ap.add_argument("--detail-top", type=int, default=20, help="jumlah saham teratas yang dibuatkan halaman detail lengkap di PDF")
+    ap.add_argument("--no-chart", action="store_true", help="PDF tanpa grafik")
     ap.add_argument("--source", choices=["auto", "tv", "yahoo"], default="auto",
                     help="sumber harga: auto = TradingView lalu Yahoo (default)")
     args = ap.parse_args()
@@ -908,9 +1427,9 @@ def main():
     _SOURCE = args.source
 
     idx = args.market == "idx"
-    if not args.tickers and args.scan is None and not args.scan_file:
-        ap.error("isi kode saham, atau gunakan --scan / --scan-file")
-    scan_mode = args.scan is not None or args.scan_file
+    if not args.tickers and args.scan is None and not args.scan_file and not args.universe:
+        ap.error("isi kode saham, atau gunakan --universe all / --scan / --scan-file")
+    scan_mode = args.scan is not None or args.scan_file or args.universe or len(args.tickers) > 1
 
     def once():
         run_scan(args, idx) if scan_mode else run_single(args, idx)
